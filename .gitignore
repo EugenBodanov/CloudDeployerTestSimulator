@@ -1,4 +1,7 @@
 /.venv/
+__pycache__/
+**/__pycache__/
+*.pyc
 /simulator-key.pem
 ./simulator/.env
 /simulator/config.json
@@ -10,4 +13,3 @@
 ~/.pulumi/**
 /Pulumi.dev.yaml
 /input/config_credentials.json
-/simulator/_pycache__/

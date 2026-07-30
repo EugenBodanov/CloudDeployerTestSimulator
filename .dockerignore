@@ -1,0 +1,16 @@
+.git
+.gitignore
+.idea
+.env
+.venv
+.pytest_cache
+__pycache__
+**/__pycache__
+*.pyc
+input
+sdks
+Pulumi.*.yaml
+simulator-key.pem
+simulator/.env
+simulator/config*.json
+input/config_credentials.json
