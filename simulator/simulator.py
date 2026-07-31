@@ -7,9 +7,8 @@ from .SimulationLoop import SimulationLoop
 
 
 CONFIG_JSON_PATH = os.path.abspath(os.getenv('CONFIG_JSON_PATH', './config.json'))
-HIERARCHY_JSON_PATH = os.path.abspath(os.getenv('CONFIG_HIERARCHY_JSON_PATH', './config_hierarchy.json'))
+HIERARCHY_JSON_PATH = os.path.abspath(os.getenv('CONFIG_HIERARCHY_JSON_PATH', './config_hierarchy.json'))   
 IOT_DEVICE_JSON_PATH = os.path.abspath(os.getenv('CONFIG_IOT_JSON_PATH', './config_iot_devices.json'))
-AWS_REGION = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION")
 
 
 def build_row(entity: dm.Entity, component: dm.Component, attribute: dm.Attribute, sim: SimulationLoop):
@@ -54,6 +53,8 @@ def build_row(entity: dm.Entity, component: dm.Component, attribute: dm.Attribut
                                 config_inputs['vec_min'] = ui.input('vec_min').props('dense outlined')
                                 config_inputs['vec_max'] = ui.input('vec_max').props('dense outlined')
 
+                    # 'api' is intentionally not offered for VECTOR attributes: the predefined
+                    # provider yields a scalar. The backend keeps its VECTOR handling for later.
                     mode_select = ui.select(
                         ['vector_custom', 'vector_uniform'],
                         value='vector_custom',
@@ -80,9 +81,11 @@ def build_row(entity: dm.Entity, component: dm.Component, attribute: dm.Attribut
                                 config_inputs['list'] = ui.input('list').props('dense outlined')
                             elif mode == 'random_string':
                                 pass
+                            elif mode == 'api':
+                                ui.label('Uses Energy Charts renewable-share forecast (Germany)').classes('text-sm text-slate-600 col-span-3')
 
                     mode_select = ui.select(
-                        ['fixed_list', 'random_string'],
+                        ['fixed_list', 'random_string', 'api'],
                         value='fixed_list',
                         on_change=update_string_fields,
                     ).props('dense outlined')
@@ -113,9 +116,13 @@ def build_row(entity: dm.Entity, component: dm.Component, attribute: dm.Attribut
                                 config_inputs['min'] = ui.input('min').props('dense outlined')
                                 config_inputs['max'] = ui.input('max').props('dense outlined')
                                 config_inputs['step'] = ui.input('step').props('dense outlined')
+                            elif mode == 'cycle':
+                                config_inputs['start'] = ui.number('Start value').props('dense outlined')
+                            elif mode == 'api':
+                                ui.label('Uses Energy Charts renewable-share forecast (Germany)').classes('text-sm text-slate-600 col-span-3')
 
                     mode_select = ui.select(
-                        ['uniform', 'normal', 'range'],
+                        ['uniform', 'normal', 'range', 'cycle', 'api'],
                         value='uniform',
                         on_change=update_numeric_fields,
                     ).props('dense outlined')
@@ -124,7 +131,7 @@ def build_row(entity: dm.Entity, component: dm.Component, attribute: dm.Attribut
                     with input_container:
                         config_inputs['min'] = ui.input('min').props('dense outlined')
                         config_inputs['max'] = ui.input('max').props('dense outlined')
-
+        
         def update_field_state():
             for field in config_inputs.values():
                 if hasattr(field, 'props'):
@@ -144,6 +151,10 @@ def build_row(entity: dm.Entity, component: dm.Component, attribute: dm.Attribut
                 config = {name: field.value for name, field in config_inputs.items() if
                           name != 'mode' and field in field_box.descendants()}
                 config['mode'] = config_inputs['mode'].value
+                # 'start' is optional: an empty field is not sent at all, so cycle mode
+                # falls back to its existing default and begins at 0
+                if config.get('start') in (None, ''):
+                    config.pop('start', None)
                 sim.start_one(attribute, component.iotDeviceId, config)
                 status_label.text = 'runs'
                 status_label.classes(replace='w-full text-center text-sm font-medium py-1 px-2 rounded bg-green-500 text-white')
@@ -153,7 +164,7 @@ def build_row(entity: dm.Entity, component: dm.Component, attribute: dm.Attribut
 
 twin = dm.Twin()
 twin.read_from_json(CONFIG_JSON_PATH, IOT_DEVICE_JSON_PATH, HIERARCHY_JSON_PATH)
-sim = SimulationLoop(topic=twin.name+"/iot-data", region=AWS_REGION)
+sim = SimulationLoop(topic=twin.name+"/iot-data")
 
 
 @ui.page('/')
@@ -181,7 +192,7 @@ def index_page():
 
 
 def main():
-    ui.run(host="0.0.0.0", port=5000, reload=False, show=False)
+    ui.run(host="0.0.0.0", port=5000)
 
 
 if __name__ in {"__main__", "__mp_main__"}:
