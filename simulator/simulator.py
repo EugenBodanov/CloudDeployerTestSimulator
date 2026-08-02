@@ -7,8 +7,9 @@ from .SimulationLoop import SimulationLoop
 
 
 CONFIG_JSON_PATH = os.path.abspath(os.getenv('CONFIG_JSON_PATH', './config.json'))
-HIERARCHY_JSON_PATH = os.path.abspath(os.getenv('CONFIG_HIERARCHY_JSON_PATH', './config_hierarchy.json'))   
+HIERARCHY_JSON_PATH = os.path.abspath(os.getenv('CONFIG_HIERARCHY_JSON_PATH', './config_hierarchy.json'))
 IOT_DEVICE_JSON_PATH = os.path.abspath(os.getenv('CONFIG_IOT_JSON_PATH', './config_iot_devices.json'))
+AWS_REGION = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION")
 
 
 def build_row(entity: dm.Entity, component: dm.Component, attribute: dm.Attribute, sim: SimulationLoop):
@@ -53,8 +54,6 @@ def build_row(entity: dm.Entity, component: dm.Component, attribute: dm.Attribut
                                 config_inputs['vec_min'] = ui.input('vec_min').props('dense outlined')
                                 config_inputs['vec_max'] = ui.input('vec_max').props('dense outlined')
 
-                    # 'api' is intentionally not offered for VECTOR attributes: the predefined
-                    # provider yields a scalar. The backend keeps its VECTOR handling for later.
                     mode_select = ui.select(
                         ['vector_custom', 'vector_uniform'],
                         value='vector_custom',
@@ -131,7 +130,7 @@ def build_row(entity: dm.Entity, component: dm.Component, attribute: dm.Attribut
                     with input_container:
                         config_inputs['min'] = ui.input('min').props('dense outlined')
                         config_inputs['max'] = ui.input('max').props('dense outlined')
-        
+
         def update_field_state():
             for field in config_inputs.values():
                 if hasattr(field, 'props'):
@@ -164,7 +163,7 @@ def build_row(entity: dm.Entity, component: dm.Component, attribute: dm.Attribut
 
 twin = dm.Twin()
 twin.read_from_json(CONFIG_JSON_PATH, IOT_DEVICE_JSON_PATH, HIERARCHY_JSON_PATH)
-sim = SimulationLoop(topic=twin.name+"/iot-data")
+sim = SimulationLoop(topic=twin.name+"/iot-data", region=AWS_REGION)
 
 
 @ui.page('/')
@@ -192,7 +191,7 @@ def index_page():
 
 
 def main():
-    ui.run(host="0.0.0.0", port=5000)
+    ui.run(host="0.0.0.0", port=5000, reload=False, show=False)
 
 
 if __name__ in {"__main__", "__mp_main__"}:

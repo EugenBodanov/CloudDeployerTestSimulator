@@ -11,16 +11,18 @@ import urllib.request
 from datetime import datetime, timezone
 import boto3
 
-from .domain import Attribute, DataType 
+from .domain import Attribute, DataType
 
 CREDENTIALS_PATH = os.path.abspath(os.getenv('CONFIG_CREDENTIALS_JSON', './input/config_credentials.json'))
+DEFAULT_AWS_REGION = "eu-central-1"
+
 
 def safe_float(value, default=0.0):
     if value is None or str(value).strip() == "":
         return default
     try:
         return float(value)
-    except ValueError:
+    except (TypeError, ValueError):
         return default
 
 
@@ -235,6 +237,7 @@ def generate_value(config: dict, dtype: str):
 
     return 0
 
+
 class AWS_CREDENTIALS:
     def __init__(self, credentials_path=CREDENTIALS_PATH):
         if not os.path.exists(credentials_path):
@@ -242,20 +245,18 @@ class AWS_CREDENTIALS:
         with open(credentials_path, 'r') as f:
             self.credentials = json.load(f)
 
+
 class SimulationLoop:
-    def __init__(self, topic: str):
+    def __init__(self, topic: str, region: str | None = None):
         self.topic = topic
-        creds = AWS_CREDENTIALS().credentials
-        self.client = boto3.client(
-            'iot-data',
-            region_name=creds["aws_region"],
-            aws_access_key_id=creds["aws_access_key_id"],
-            aws_secret_access_key=creds["aws_secret_access_key"],
-        )
+        self.mock_aws = _is_enabled(os.getenv("SIMULATOR_MOCK_AWS"))
+        self.client = None if self.mock_aws else _create_iot_client(region)
         self.active_runs: dict[str, dict] = {}
         self.sim_time = 10.0
         self._lock = threading.Lock()
         self._last_generation = 0
+        if self.mock_aws:
+            print("SIMULATOR_MOCK_AWS is enabled. Payloads will be logged, not published to AWS IoT Core.")
 
     def is_running(self, attribute_id: str) -> bool:
         return self.active_runs.get(attribute_id, {}).get("run", False)
@@ -340,12 +341,17 @@ class SimulationLoop:
                 attribute.name: simulated_value,
             }
 
-            # Producing the value can block (an API fetch runs until its timeout), so
-            # re-check that this run is still the active one before publishing.
+            # Producing the value can take a moment, so re-check that this run is
+            # still the active one right before publishing.
             if not self._is_active(attribute.id, generation):
                 break
 
             print(f"Publishing to {self.topic}: {payload_dict}")
+            if self.mock_aws:
+                print("Mock AWS publish: 200")
+                time.sleep(self.sim_time)
+                continue
+
             try:
 
                 response = self.client.publish(
@@ -360,3 +366,28 @@ class SimulationLoop:
             time.sleep(self.sim_time)
 
         print(f"Thread stopped for: {attribute.name} ({attribute.id})")
+
+
+def _create_iot_client(region: str | None):
+    if os.path.exists(CREDENTIALS_PATH):
+        creds = AWS_CREDENTIALS().credentials
+        return boto3.client(
+            'iot-data',
+            region_name=region or creds["aws_region"],
+            aws_access_key_id=creds["aws_access_key_id"],
+            aws_secret_access_key=creds["aws_secret_access_key"],
+        )
+
+    return boto3.client(
+        'iot-data',
+        region_name=(
+            region
+            or os.getenv("AWS_REGION")
+            or os.getenv("AWS_DEFAULT_REGION")
+            or DEFAULT_AWS_REGION
+        ),
+    )
+
+
+def _is_enabled(value: str | None) -> bool:
+    return value is not None and value.strip().lower() in {"1", "true", "yes", "on"}
