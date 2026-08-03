@@ -80,9 +80,11 @@ def build_row(entity: dm.Entity, component: dm.Component, attribute: dm.Attribut
                                 config_inputs['list'] = ui.input('list').props('dense outlined')
                             elif mode == 'random_string':
                                 pass
+                            elif mode == 'api':
+                                ui.label('Uses Energy Charts renewable-share forecast (Germany)').classes('text-sm text-slate-600 col-span-3')
 
                     mode_select = ui.select(
-                        ['fixed_list', 'random_string'],
+                        ['fixed_list', 'random_string', 'api'],
                         value='fixed_list',
                         on_change=update_string_fields,
                     ).props('dense outlined')
@@ -113,9 +115,13 @@ def build_row(entity: dm.Entity, component: dm.Component, attribute: dm.Attribut
                                 config_inputs['min'] = ui.input('min').props('dense outlined')
                                 config_inputs['max'] = ui.input('max').props('dense outlined')
                                 config_inputs['step'] = ui.input('step').props('dense outlined')
+                            elif mode == 'cycle':
+                                config_inputs['start'] = ui.number('Start value').props('dense outlined')
+                            elif mode == 'api':
+                                ui.label('Uses Energy Charts renewable-share forecast (Germany)').classes('text-sm text-slate-600 col-span-3')
 
                     mode_select = ui.select(
-                        ['uniform', 'normal', 'range'],
+                        ['uniform', 'normal', 'range', 'cycle', 'api'],
                         value='uniform',
                         on_change=update_numeric_fields,
                     ).props('dense outlined')
@@ -144,6 +150,10 @@ def build_row(entity: dm.Entity, component: dm.Component, attribute: dm.Attribut
                 config = {name: field.value for name, field in config_inputs.items() if
                           name != 'mode' and field in field_box.descendants()}
                 config['mode'] = config_inputs['mode'].value
+                # 'start' is optional: an empty field is not sent at all, so cycle mode
+                # falls back to its existing default and begins at 0
+                if config.get('start') in (None, ''):
+                    config.pop('start', None)
                 sim.start_one(attribute, component.iotDeviceId, config)
                 status_label.text = 'runs'
                 status_label.classes(replace='w-full text-center text-sm font-medium py-1 px-2 rounded bg-green-500 text-white')

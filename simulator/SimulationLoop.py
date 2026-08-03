@@ -1,8 +1,13 @@
+import bisect
 import json
+import math
 import os
 import random
+import re
 import threading
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 import boto3
 
@@ -19,6 +24,172 @@ def safe_float(value, default=0.0):
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def safe_int(value, default=0):
+    if value is None or str(value).strip() == "":
+        return default
+    try:
+        return int(value)
+    except (ValueError, TypeError):
+        return default
+
+
+def parse_headers(raw_headers: str) -> dict:
+    if raw_headers is None:
+        return {}
+
+    value = str(raw_headers).strip()
+    if not value:
+        return {}
+
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return {}
+
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def extract_json_value(payload, json_path: str):
+    if json_path is None or str(json_path).strip() == "":
+        return payload
+
+    tokens = re.findall(r'[^.\[\]]+|\[\d+\]', str(json_path).strip())
+    current = payload
+
+    for token in tokens:
+        if not token:
+            continue
+
+        if token.startswith('[') and token.endswith(']'):
+            if not isinstance(current, list):
+                return None
+            index = int(token[1:-1])
+            if index < 0 or index >= len(current):
+                return None
+            current = current[index]
+        else:
+            if isinstance(current, dict):
+                current = current.get(token)
+            else:
+                return None
+
+        if current is None:
+            return None
+
+    return current
+
+
+def coerce_value(value, dtype: str):
+    """Convert a value taken from an API response into the attribute's data type.
+
+    Raises ValueError when the value cannot be represented, so the caller can skip
+    the publish. Returning a fallback of 0/0.0/[] would be indistinguishable from a
+    genuine reading and would hide the failure.
+    """
+    if value is None:
+        raise ValueError(f"API value is null, cannot convert to {dtype}")
+
+    if dtype == "STRING":
+        return str(value)
+
+    if dtype in ("INTEGER", "DOUBLE"):
+        if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+            raise ValueError(f"API value {value!r} is not numeric")
+        try:
+            number = float(value)
+        except ValueError as exc:
+            raise ValueError(f"API value {value!r} is not numeric") from exc
+        if math.isnan(number) or math.isinf(number):
+            raise ValueError(f"API value {value!r} is not a finite number")
+        return int(number) if dtype == "INTEGER" else round(number, 2)
+
+    if dtype.startswith("VECTOR_"):
+        if not isinstance(value, list):
+            raise ValueError(f"API value {value!r} is not a list, cannot convert to {dtype}")
+        base_dtype = dtype.replace("VECTOR_", "")
+        return [coerce_value(item, base_dtype) for item in value]
+
+    return value
+
+
+DEFAULT_API_PROVIDER = {
+    "name": "Energy Charts renewable share forecast",
+    "url": "https://api.energy-charts.info/ren_share_forecast?country=de",
+    "json_path": "ren_share",
+    "timestamp_path": "unix_seconds",
+}
+
+
+def fetch_json(url: str, headers: dict, timeout: int):
+    request = urllib.request.Request(url, headers=headers)
+
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            raw_body = response.read().decode('utf-8')
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, ValueError) as exc:
+        raise RuntimeError(f"API request failed: {exc}") from exc
+
+    try:
+        return json.loads(raw_body)
+    except json.JSONDecodeError as exc:
+        raise ValueError("API response is not valid JSON") from exc
+
+
+def select_current_sample(timestamps: list, values: list, now_epoch: float = None):
+    """Pick the (timestamp, value) pair whose timestamp is the newest one at or before now.
+
+    The provider returns a fixed local-day window rather than a rolling one, so the last
+    element of the series is a forecast hours ahead, not the current reading. Sibling
+    series can also be shorter than unix_seconds, so only the paired prefix is searched.
+    """
+    if now_epoch is None:
+        now_epoch = datetime.now(timezone.utc).timestamp()
+
+    paired = min(len(timestamps), len(values))
+    if paired == 0:
+        raise ValueError("API response contained no data points")
+
+    index = bisect.bisect_right(timestamps, now_epoch, 0, paired) - 1
+    index = max(0, min(index, paired - 1))
+    return timestamps[index], values[index]
+
+
+def fetch_predefined_api_value(dtype: str):
+    """Return (value, epoch_seconds) for the current point of the predefined provider."""
+    provider = DEFAULT_API_PROVIDER
+    payload = fetch_json(provider["url"], {}, 15)
+
+    values = extract_json_value(payload, provider["json_path"])
+    if not isinstance(values, list) or not values:
+        raise ValueError(f"API response did not contain a '{provider['json_path']}' list")
+
+    timestamps = extract_json_value(payload, provider["timestamp_path"])
+    if not isinstance(timestamps, list) or not timestamps:
+        raise ValueError(f"API response did not contain a '{provider['timestamp_path']}' list")
+
+    sample_epoch, raw_value = select_current_sample(timestamps, values)
+    return coerce_value(raw_value, dtype), sample_epoch
+
+
+def fetch_api_value(config: dict, dtype: str):
+    """Return (value, epoch_seconds) where epoch_seconds is None if the API carries no timestamp."""
+    if config.get("api_url"):
+        api_url = str(config.get("api_url", "")).strip()
+        json_path = config.get("json_path", "")
+        timeout = max(1, safe_int(config.get("timeout"), 10))
+        headers = parse_headers(config.get("headers", ""))
+
+        payload = fetch_json(api_url, headers, timeout)
+
+        extracted = extract_json_value(payload, json_path)
+        if extracted is None:
+            raise ValueError("API response field was not found")
+
+        return coerce_value(extracted, dtype), None
+
+    return fetch_predefined_api_value(dtype)
 
 
 def generate_value(config: dict, dtype: str):
@@ -82,32 +253,49 @@ class SimulationLoop:
         self.client = None if self.mock_aws else _create_iot_client(region)
         self.active_runs: dict[str, dict] = {}
         self.sim_time = 10.0
+        self._lock = threading.Lock()
+        self._last_generation = 0
         if self.mock_aws:
             print("SIMULATOR_MOCK_AWS is enabled. Payloads will be logged, not published to AWS IoT Core.")
 
     def is_running(self, attribute_id: str) -> bool:
         return self.active_runs.get(attribute_id, {}).get("run", False)
 
-    def start_one(self, attribute: Attribute, real_device_id: str, config: dict):
-        if self.is_running(attribute.id):
-            return
+    def _is_active(self, attribute_id: str, generation: int) -> bool:
+        """True only for the newest run of this attribute.
 
-        self.active_runs[attribute.id] = {"run": True}
+        A worker can be asleep when its run is stopped and a new one started. Checking
+        the run flag alone is not enough: start_one installs a fresh {"run": True}, so
+        the old worker would wake up, see it, and keep publishing alongside the new one.
+        """
+        active_run = self.active_runs.get(attribute_id, {})
+        return active_run.get("run", False) and active_run.get("generation") == generation
+
+    def start_one(self, attribute: Attribute, real_device_id: str, config: dict):
+        with self._lock:
+            if self.is_running(attribute.id):
+                return
+
+            self._last_generation += 1
+            generation = self._last_generation
+            self.active_runs[attribute.id] = {"run": True, "generation": generation}
+
         attribute.run = True
 
         thread = threading.Thread(
             target=self._loop,
-            args=(attribute, real_device_id, config),
+            args=(attribute, real_device_id, config, generation),
             daemon=True,
         )
         thread.start()
 
     def stop_one(self, attribute: Attribute):
-        if attribute.id in self.active_runs:
-            self.active_runs[attribute.id]["run"] = False
+        with self._lock:
+            if attribute.id in self.active_runs:
+                self.active_runs[attribute.id]["run"] = False
         attribute.run = False
 
-    def _loop(self, attribute: Attribute, real_device_id: str, config: dict):
+    def _loop(self, attribute: Attribute, real_device_id: str, config: dict, generation: int):
         mode = config.get("mode")
         dtype = attribute.dataType.value
 
@@ -118,22 +306,45 @@ class SimulationLoop:
             mx = safe_float(config.get("max"), 100.0)
             step = safe_float(config.get("step"), 1.0)
             current_value = mn
+        elif mode == "cycle":
+            current_value = safe_int(config.get("start"), 0) % 24
 
-        while self.active_runs.get(attribute.id, {}).get("run", False):
+        while self._is_active(attribute.id, generation):
+            sample_epoch = None
+
             if mode == "range":
                 simulated_value = round(current_value, 2) if dtype == "DOUBLE" else int(current_value)
                 current_value += step
                 if current_value > mx:
                     current_value = mn
+            elif mode == "cycle":
+                simulated_value = round(float(current_value), 2) if dtype == "DOUBLE" else int(current_value)
+                current_value = (current_value + 1) % 24
+            elif mode == "api":
+                try:
+                    simulated_value, sample_epoch = fetch_api_value(config, dtype)
+                except Exception as exc:
+                    print(f"API mode failed for {attribute.name}: {exc} - skipping publish")
+                    time.sleep(self.sim_time)
+                    continue
             else:
                 simulated_value = generate_value(config, dtype)
 
-            now_utc = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
+            # API values carry the timestamp of the sample they were read from, so that the
+            # published value and time always describe the same point in the series.
+            moment = (datetime.fromtimestamp(sample_epoch, timezone.utc)
+                      if sample_epoch is not None else datetime.now(timezone.utc))
+            timestamp = moment.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
             payload_dict = {
                 "iotDeviceId": real_device_id,
-                "time": now_utc,
+                "time": timestamp,
                 attribute.name: simulated_value,
             }
+
+            # Producing the value can take a moment, so re-check that this run is
+            # still the active one right before publishing.
+            if not self._is_active(attribute.id, generation):
+                break
 
             print(f"Publishing to {self.topic}: {payload_dict}")
             if self.mock_aws:
