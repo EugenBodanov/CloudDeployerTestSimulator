@@ -21,6 +21,31 @@ def build_row(entity: dm.Entity, component: dm.Component, attribute: dm.Attribut
         ui.label(attribute.name).classes('truncate text-slate-700')
         ui.label(attribute.dataType.value).classes('font-mono text-xs bg-slate-100 p-1 rounded text-center truncate')
 
+        if attribute.name.startswith('act'):
+            feedback_status_label = ui.label('waiting').classes(
+                'w-full text-center text-sm font-medium py-1 px-2 rounded text-white bg-slate-400'
+            )
+            feedback_value_label = ui.label('no data received yet').classes(
+                'col-span-3 text-sm text-slate-700 font-mono truncate'
+            )
+            ui.label('receive only').classes('w-full text-center text-xs text-slate-400')
+
+            def refresh_feedback():
+                feedback = sim.get_feedback(component.iotDeviceId, attribute.name)
+                if feedback is None:
+                    return
+                feedback_value_label.text = (
+                    f"value={feedback['value']}  source_time={feedback['source_time']}  "
+                    f"received_at={feedback['received_at']}"
+                )
+                feedback_status_label.text = 'received'
+                feedback_status_label.classes(
+                    replace='w-full text-center text-sm font-medium py-1 px-2 rounded bg-green-500 text-white'
+                )
+
+            ui.timer(1.0, refresh_feedback)
+            return
+
         is_running = sim.is_running(attribute.id)
         status_label = ui.label('runs' if is_running else 'stopped').classes(
             'w-full text-center text-sm font-medium py-1 px-2 rounded text-white '

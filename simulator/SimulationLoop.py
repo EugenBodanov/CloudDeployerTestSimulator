@@ -8,8 +8,11 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
 from datetime import datetime, timezone
 import boto3
+from awscrt import auth, mqtt5
+from awsiot import mqtt5_client_builder
 
 from .domain import Attribute, DataType
 
@@ -255,8 +258,13 @@ class SimulationLoop:
         self.sim_time = 10.0
         self._lock = threading.Lock()
         self._last_generation = 0
+        self.received_values: dict[tuple[str, str], dict] = {}
+        self._feedback_lock = threading.Lock()
+        self._mqtt5_client = None
         if self.mock_aws:
             print("SIMULATOR_MOCK_AWS is enabled. Payloads will be logged, not published to AWS IoT Core.")
+        else:
+            self._start_feedback_listener(region)
 
     def is_running(self, attribute_id: str) -> bool:
         return self.active_runs.get(attribute_id, {}).get("run", False)
@@ -294,6 +302,70 @@ class SimulationLoop:
             if attribute.id in self.active_runs:
                 self.active_runs[attribute.id]["run"] = False
         attribute.run = False
+
+    def get_feedback(self, device_id: str, property_name: str) -> dict | None:
+        with self._feedback_lock:
+            return self.received_values.get((device_id, property_name))
+
+    def _start_feedback_listener(self, region: str | None):
+        """Subscribe to this twin's own topic to pick up 'act*' values the pipeline
+        publishes back onto it. Runs over MQTT via WebSockets with SigV4, reusing the
+        same AWS credentials used for publishing - no device certificates involved.
+        """
+        resolved_region = (
+            region
+            or os.getenv("AWS_REGION")
+            or os.getenv("AWS_DEFAULT_REGION")
+            or DEFAULT_AWS_REGION
+        )
+
+        try:
+            endpoint = boto3.client('iot', region_name=resolved_region).describe_endpoint(
+                endpointType='iot:Data-ATS'
+            )['endpointAddress']
+
+            client_id = f"simulator-{self.topic.replace('/', '-')}-{uuid.uuid4().hex[:8]}"
+            credentials_provider = auth.AwsCredentialsProvider.new_default()
+
+            self._mqtt5_client = mqtt5_client_builder.websockets_with_default_aws_signing(
+                endpoint=endpoint,
+                region=resolved_region,
+                credentials_provider=credentials_provider,
+                client_id=client_id,
+                on_publish_received=self._on_feedback_received,
+            )
+            self._mqtt5_client.start()
+
+            subscribe_future = self._mqtt5_client.subscribe(
+                subscribe_packet=mqtt5.SubscribePacket(
+                    subscriptions=[mqtt5.Subscription(topic_filter=self.topic, qos=mqtt5.QoS.AT_LEAST_ONCE)]
+                )
+            )
+            subscribe_future.result(timeout=10)
+            print(f"Feedback listener subscribed to {self.topic} as {client_id}")
+        except Exception as exc:
+            print(f"Feedback listener failed to start: {exc} - act* attributes will not receive live updates")
+
+    def _on_feedback_received(self, data):
+        try:
+            payload = json.loads(data.publish_packet.payload.decode('utf-8'))
+        except (json.JSONDecodeError, AttributeError, UnicodeDecodeError) as exc:
+            print(f"Feedback listener: could not parse message payload: {exc}")
+            return
+
+        device_id = payload.get("iotDeviceId")
+        source_time = payload.get("time")
+        received_at = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
+
+        for key, value in payload.items():
+            if key in ("iotDeviceId", "time") or not key.startswith("act"):
+                continue
+            with self._feedback_lock:
+                self.received_values[(device_id, key)] = {
+                    "value": value,
+                    "source_time": source_time,
+                    "received_at": received_at,
+                }
 
     def _loop(self, attribute: Attribute, real_device_id: str, config: dict, generation: int):
         mode = config.get("mode")
