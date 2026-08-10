@@ -312,12 +312,7 @@ class SimulationLoop:
         publishes back onto it. Runs over MQTT via WebSockets with SigV4, reusing the
         same AWS credentials used for publishing - no device certificates involved.
         """
-        resolved_region = (
-            region
-            or os.getenv("AWS_REGION")
-            or os.getenv("AWS_DEFAULT_REGION")
-            or DEFAULT_AWS_REGION
-        )
+        resolved_region = _resolve_region(region)
 
         try:
             endpoint = boto3.client('iot', region_name=resolved_region).describe_endpoint(
@@ -325,7 +320,7 @@ class SimulationLoop:
             )['endpointAddress']
 
             client_id = f"simulator-{self.topic.replace('/', '-')}-{uuid.uuid4().hex[:8]}"
-            credentials_provider = auth.AwsCredentialsProvider.new_default()
+            credentials_provider = auth.AwsCredentialsProvider.new_default_chain()
 
             self._mqtt5_client = mqtt5_client_builder.websockets_with_default_aws_signing(
                 endpoint=endpoint,
@@ -333,18 +328,35 @@ class SimulationLoop:
                 credentials_provider=credentials_provider,
                 client_id=client_id,
                 on_publish_received=self._on_feedback_received,
+                on_lifecycle_connection_success=self._on_feedback_connection_success,
             )
             self._mqtt5_client.start()
+            print(f"Feedback listener connecting to {self.topic} as {client_id}")
+        except Exception as exc:
+            print(f"Feedback listener failed to start: {exc} - act* attributes will not receive live updates")
 
+    def _on_feedback_connection_success(self, lifecycle_data):
+        """The client defaults to a clean MQTT session (ClientSessionBehaviorType.DEFAULT),
+        so the broker does not remember subscriptions across a reconnect. (Re)subscribe on
+        every successful connection - not just once at startup - so a dropped connection
+        doesn't silently leave this attribute deaf to feedback until the process restarts.
+        """
+        try:
             subscribe_future = self._mqtt5_client.subscribe(
                 subscribe_packet=mqtt5.SubscribePacket(
                     subscriptions=[mqtt5.Subscription(topic_filter=self.topic, qos=mqtt5.QoS.AT_LEAST_ONCE)]
                 )
             )
-            subscribe_future.result(timeout=10)
-            print(f"Feedback listener subscribed to {self.topic} as {client_id}")
+            subscribe_future.add_done_callback(self._on_feedback_subscribe_done)
         except Exception as exc:
-            print(f"Feedback listener failed to start: {exc} - act* attributes will not receive live updates")
+            print(f"Feedback listener: failed to (re)subscribe to {self.topic}: {exc}")
+
+    def _on_feedback_subscribe_done(self, future):
+        exc = future.exception()
+        if exc is not None:
+            print(f"Feedback listener: subscribe to {self.topic} failed: {exc}")
+        else:
+            print(f"Feedback listener: subscribed to {self.topic}")
 
     def _on_feedback_received(self, data):
         try:
@@ -440,25 +452,34 @@ class SimulationLoop:
         print(f"Thread stopped for: {attribute.name} ({attribute.id})")
 
 
-def _create_iot_client(region: str | None):
+def _resolve_region(region: str | None) -> str:
+    """Single source of truth for region resolution, shared by the publish client
+    and the feedback listener so the two can never end up pointed at different regions.
+    """
+    if region:
+        return region
+
     if os.path.exists(CREDENTIALS_PATH):
-        creds = AWS_CREDENTIALS().credentials
+        creds_region = AWS_CREDENTIALS(CREDENTIALS_PATH).credentials.get("aws_region")
+        if creds_region:
+            return creds_region
+
+    return os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or DEFAULT_AWS_REGION
+
+
+def _create_iot_client(region: str | None):
+    resolved_region = _resolve_region(region)
+
+    if os.path.exists(CREDENTIALS_PATH):
+        creds = AWS_CREDENTIALS(CREDENTIALS_PATH).credentials
         return boto3.client(
             'iot-data',
-            region_name=region or creds["aws_region"],
+            region_name=resolved_region,
             aws_access_key_id=creds["aws_access_key_id"],
             aws_secret_access_key=creds["aws_secret_access_key"],
         )
 
-    return boto3.client(
-        'iot-data',
-        region_name=(
-            region
-            or os.getenv("AWS_REGION")
-            or os.getenv("AWS_DEFAULT_REGION")
-            or DEFAULT_AWS_REGION
-        ),
-    )
+    return boto3.client('iot-data', region_name=resolved_region)
 
 
 def _is_enabled(value: str | None) -> bool:
