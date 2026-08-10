@@ -8,6 +8,7 @@ from simulator.SimulationLoop import (
     _resolve_region,
     _resolve_credentials,
     _resolve_credentials_provider,
+    _boto3_client,
     DEFAULT_AWS_REGION,
 )
 
@@ -164,6 +165,26 @@ class TestResolveCredentials:
         mqtt_key = sim_module._resolve_credentials_provider().get_credentials().result(timeout=5).access_key_id
 
         assert publish_key == mqtt_key == "FILEKEY"
+
+    def test_endpoint_lookup_client_also_uses_the_resolved_credentials(self, monkeypatch, tmp_path):
+        """Regression test: the boto3 'iot' client used to look up the Data-ATS endpoint
+        in _start_feedback_listener was built with only region_name, no credentials - so
+        it silently fell back to boto3's own default chain instead of the credentials
+        file, even when the publish client and MQTT provider were both using the file.
+        _boto3_client() is now the single construction point for every boto3 client in
+        this module, so that mistake can't happen at a new call site either.
+        """
+        creds_file = tmp_path / "creds.json"
+        creds_file.write_text(json.dumps({
+            "aws_region": "eu-central-2",
+            "aws_access_key_id": "FILEKEY",
+            "aws_secret_access_key": "FILESECRET",
+        }))
+        monkeypatch.setattr("simulator.SimulationLoop.CREDENTIALS_PATH", str(creds_file))
+
+        client = _boto3_client('iot', 'eu-central-2')
+
+        assert client._request_signer._credentials.access_key == "FILEKEY"
 
     def test_provider_falls_back_to_default_chain_without_raising(self, monkeypatch):
         monkeypatch.setattr("simulator.SimulationLoop.CREDENTIALS_PATH", "/no/such/file.json")

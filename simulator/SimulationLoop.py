@@ -315,7 +315,7 @@ class SimulationLoop:
         resolved_region = _resolve_region(region)
 
         try:
-            endpoint = boto3.client('iot', region_name=resolved_region).describe_endpoint(
+            endpoint = _boto3_client('iot', resolved_region).describe_endpoint(
                 endpointType='iot:Data-ATS'
             )['endpointAddress']
 
@@ -493,20 +493,29 @@ def _resolve_region(region: str | None) -> str:
     return os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or DEFAULT_AWS_REGION
 
 
-def _create_iot_client(region: str | None):
+def _boto3_client(service_name: str, region: str | None = None):
+    """Single construction point for every boto3 client in this file, so region and
+    credential resolution can never drift between them - every caller (publish client,
+    endpoint lookup, anything added later) goes through the same resolved values instead
+    of any of them accidentally falling back to boto3's own default chain on their own.
+    """
     resolved_region = _resolve_region(region)
     creds = _resolve_credentials()
 
     if creds is not None:
         return boto3.client(
-            'iot-data',
+            service_name,
             region_name=resolved_region,
             aws_access_key_id=creds["aws_access_key_id"],
             aws_secret_access_key=creds["aws_secret_access_key"],
             aws_session_token=creds.get("aws_session_token"),
         )
 
-    return boto3.client('iot-data', region_name=resolved_region)
+    return boto3.client(service_name, region_name=resolved_region)
+
+
+def _create_iot_client(region: str | None):
+    return _boto3_client('iot-data', region)
 
 
 def _is_enabled(value: str | None) -> bool:
