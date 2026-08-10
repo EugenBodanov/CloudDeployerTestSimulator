@@ -320,7 +320,7 @@ class SimulationLoop:
             )['endpointAddress']
 
             client_id = f"simulator-{self.topic.replace('/', '-')}-{uuid.uuid4().hex[:8]}"
-            credentials_provider = auth.AwsCredentialsProvider.new_default_chain()
+            credentials_provider = _resolve_credentials_provider()
 
             self._mqtt5_client = mqtt5_client_builder.websockets_with_default_aws_signing(
                 endpoint=endpoint,
@@ -452,6 +452,33 @@ class SimulationLoop:
         print(f"Thread stopped for: {attribute.name} ({attribute.id})")
 
 
+def _resolve_credentials() -> dict | None:
+    """Single source of truth for credential resolution, shared by the publish client
+    and the feedback listener so the two can never end up authenticating differently.
+
+    Returns the credentials file's contents if one is present, or None to signal
+    "use this SDK's own default credential chain (env vars / IMDS / profile / etc.)".
+    """
+    if os.path.exists(CREDENTIALS_PATH):
+        return AWS_CREDENTIALS(CREDENTIALS_PATH).credentials
+    return None
+
+
+def _resolve_credentials_provider() -> "auth.AwsCredentialsProvider":
+    """The MQTT-side counterpart of _resolve_credentials(): builds a static
+    awscrt credentials provider from the same credentials file the publish client
+    uses, or falls back to awscrt's own default chain when there is no file.
+    """
+    creds = _resolve_credentials()
+    if creds is not None:
+        return auth.AwsCredentialsProvider.new_static(
+            access_key_id=creds["aws_access_key_id"],
+            secret_access_key=creds["aws_secret_access_key"],
+            session_token=creds.get("aws_session_token"),
+        )
+    return auth.AwsCredentialsProvider.new_default_chain()
+
+
 def _resolve_region(region: str | None) -> str:
     """Single source of truth for region resolution, shared by the publish client
     and the feedback listener so the two can never end up pointed at different regions.
@@ -459,24 +486,24 @@ def _resolve_region(region: str | None) -> str:
     if region:
         return region
 
-    if os.path.exists(CREDENTIALS_PATH):
-        creds_region = AWS_CREDENTIALS(CREDENTIALS_PATH).credentials.get("aws_region")
-        if creds_region:
-            return creds_region
+    creds = _resolve_credentials()
+    if creds and creds.get("aws_region"):
+        return creds["aws_region"]
 
     return os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or DEFAULT_AWS_REGION
 
 
 def _create_iot_client(region: str | None):
     resolved_region = _resolve_region(region)
+    creds = _resolve_credentials()
 
-    if os.path.exists(CREDENTIALS_PATH):
-        creds = AWS_CREDENTIALS(CREDENTIALS_PATH).credentials
+    if creds is not None:
         return boto3.client(
             'iot-data',
             region_name=resolved_region,
             aws_access_key_id=creds["aws_access_key_id"],
             aws_secret_access_key=creds["aws_secret_access_key"],
+            aws_session_token=creds.get("aws_session_token"),
         )
 
     return boto3.client('iot-data', region_name=resolved_region)

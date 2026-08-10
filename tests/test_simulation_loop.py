@@ -3,7 +3,13 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from simulator.SimulationLoop import SimulationLoop, _resolve_region, DEFAULT_AWS_REGION
+from simulator.SimulationLoop import (
+    SimulationLoop,
+    _resolve_region,
+    _resolve_credentials,
+    _resolve_credentials_provider,
+    DEFAULT_AWS_REGION,
+)
 
 
 @pytest.fixture
@@ -96,6 +102,75 @@ class TestResolveRegion:
 
         captured.clear()
         assert _resolve_region(None) == publish_region == "eu-central-2"
+
+
+class TestResolveCredentials:
+    def test_returns_none_when_no_credentials_file(self, monkeypatch):
+        monkeypatch.setattr("simulator.SimulationLoop.CREDENTIALS_PATH", "/no/such/file.json")
+        assert _resolve_credentials() is None
+
+    def test_returns_file_contents_when_present(self, monkeypatch, tmp_path):
+        creds_file = tmp_path / "creds.json"
+        creds_file.write_text(json.dumps({
+            "aws_region": "eu-central-2",
+            "aws_access_key_id": "FILEKEY",
+            "aws_secret_access_key": "FILESECRET",
+        }))
+        monkeypatch.setattr("simulator.SimulationLoop.CREDENTIALS_PATH", str(creds_file))
+
+        creds = _resolve_credentials()
+
+        assert creds["aws_access_key_id"] == "FILEKEY"
+        assert creds["aws_secret_access_key"] == "FILESECRET"
+
+    def test_provider_uses_static_credentials_matching_the_file(self, monkeypatch, tmp_path):
+        """Regression test for the bug this fix addresses: before this, the MQTT feedback
+        listener always used the default credential chain, ignoring the credentials file
+        even when the publish client was using it - the two could authenticate differently.
+        """
+        creds_file = tmp_path / "creds.json"
+        creds_file.write_text(json.dumps({
+            "aws_region": "eu-central-2",
+            "aws_access_key_id": "FILEKEY",
+            "aws_secret_access_key": "FILESECRET",
+        }))
+        monkeypatch.setattr("simulator.SimulationLoop.CREDENTIALS_PATH", str(creds_file))
+
+        provider = _resolve_credentials_provider()
+        resolved = provider.get_credentials().result(timeout=5)
+
+        assert resolved.access_key_id == "FILEKEY"
+        assert resolved.secret_access_key == "FILESECRET"
+
+    def test_publish_client_and_feedback_listener_share_the_same_credentials(self, monkeypatch, tmp_path):
+        import simulator.SimulationLoop as sim_module
+
+        creds_file = tmp_path / "creds.json"
+        creds_file.write_text(json.dumps({
+            "aws_region": "eu-central-2",
+            "aws_access_key_id": "FILEKEY",
+            "aws_secret_access_key": "FILESECRET",
+        }))
+        monkeypatch.setattr(sim_module, "CREDENTIALS_PATH", str(creds_file))
+
+        captured = {}
+        monkeypatch.setattr(
+            sim_module.boto3, "client",
+            lambda *a, **kw: captured.setdefault("key", kw.get("aws_access_key_id")) or MagicMock(),
+        )
+        sim_module._create_iot_client(None)
+        publish_key = captured["key"]
+
+        mqtt_key = sim_module._resolve_credentials_provider().get_credentials().result(timeout=5).access_key_id
+
+        assert publish_key == mqtt_key == "FILEKEY"
+
+    def test_provider_falls_back_to_default_chain_without_raising(self, monkeypatch):
+        monkeypatch.setattr("simulator.SimulationLoop.CREDENTIALS_PATH", "/no/such/file.json")
+
+        provider = _resolve_credentials_provider()  # must not raise
+
+        assert provider is not None
 
 
 class TestFeedbackReceived:
