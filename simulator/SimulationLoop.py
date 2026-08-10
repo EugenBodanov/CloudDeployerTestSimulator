@@ -8,8 +8,11 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
 from datetime import datetime, timezone
 import boto3
+from awscrt import auth, mqtt5
+from awsiot import mqtt5_client_builder
 
 from .domain import Attribute, DataType
 
@@ -255,8 +258,13 @@ class SimulationLoop:
         self.sim_time = 10.0
         self._lock = threading.Lock()
         self._last_generation = 0
+        self.received_values: dict[tuple[str, str], dict] = {}
+        self._feedback_lock = threading.Lock()
+        self._mqtt5_client = None
         if self.mock_aws:
             print("SIMULATOR_MOCK_AWS is enabled. Payloads will be logged, not published to AWS IoT Core.")
+        else:
+            self._start_feedback_listener(region)
 
     def is_running(self, attribute_id: str) -> bool:
         return self.active_runs.get(attribute_id, {}).get("run", False)
@@ -294,6 +302,82 @@ class SimulationLoop:
             if attribute.id in self.active_runs:
                 self.active_runs[attribute.id]["run"] = False
         attribute.run = False
+
+    def get_feedback(self, device_id: str, property_name: str) -> dict | None:
+        with self._feedback_lock:
+            return self.received_values.get((device_id, property_name))
+
+    def _start_feedback_listener(self, region: str | None):
+        """Subscribe to this twin's own topic to pick up 'act*' values the pipeline
+        publishes back onto it. Runs over MQTT via WebSockets with SigV4, reusing the
+        same AWS credentials used for publishing - no device certificates involved.
+        """
+        resolved_region = _resolve_region(region)
+
+        try:
+            endpoint = _boto3_client('iot', resolved_region).describe_endpoint(
+                endpointType='iot:Data-ATS'
+            )['endpointAddress']
+
+            client_id = f"simulator-{self.topic.replace('/', '-')}-{uuid.uuid4().hex[:8]}"
+            credentials_provider = _resolve_credentials_provider()
+
+            self._mqtt5_client = mqtt5_client_builder.websockets_with_default_aws_signing(
+                endpoint=endpoint,
+                region=resolved_region,
+                credentials_provider=credentials_provider,
+                client_id=client_id,
+                on_publish_received=self._on_feedback_received,
+                on_lifecycle_connection_success=self._on_feedback_connection_success,
+            )
+            self._mqtt5_client.start()
+            print(f"Feedback listener connecting to {self.topic} as {client_id}")
+        except Exception as exc:
+            print(f"Feedback listener failed to start: {exc} - act* attributes will not receive live updates")
+
+    def _on_feedback_connection_success(self, lifecycle_data):
+        """The client defaults to a clean MQTT session (ClientSessionBehaviorType.DEFAULT),
+        so the broker does not remember subscriptions across a reconnect. (Re)subscribe on
+        every successful connection - not just once at startup - so a dropped connection
+        doesn't silently leave this attribute deaf to feedback until the process restarts.
+        """
+        try:
+            subscribe_future = self._mqtt5_client.subscribe(
+                subscribe_packet=mqtt5.SubscribePacket(
+                    subscriptions=[mqtt5.Subscription(topic_filter=self.topic, qos=mqtt5.QoS.AT_LEAST_ONCE)]
+                )
+            )
+            subscribe_future.add_done_callback(self._on_feedback_subscribe_done)
+        except Exception as exc:
+            print(f"Feedback listener: failed to (re)subscribe to {self.topic}: {exc}")
+
+    def _on_feedback_subscribe_done(self, future):
+        exc = future.exception()
+        if exc is not None:
+            print(f"Feedback listener: subscribe to {self.topic} failed: {exc}")
+        else:
+            print(f"Feedback listener: subscribed to {self.topic}")
+
+    def _on_feedback_received(self, data):
+        try:
+            payload = json.loads(data.publish_packet.payload.decode('utf-8'))
+        except (json.JSONDecodeError, AttributeError, UnicodeDecodeError) as exc:
+            print(f"Feedback listener: could not parse message payload: {exc}")
+            return
+
+        device_id = payload.get("iotDeviceId")
+        source_time = payload.get("time")
+        received_at = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
+
+        for key, value in payload.items():
+            if key in ("iotDeviceId", "time") or not key.startswith("act"):
+                continue
+            with self._feedback_lock:
+                self.received_values[(device_id, key)] = {
+                    "value": value,
+                    "source_time": source_time,
+                    "received_at": received_at,
+                }
 
     def _loop(self, attribute: Attribute, real_device_id: str, config: dict, generation: int):
         mode = config.get("mode")
@@ -368,25 +452,70 @@ class SimulationLoop:
         print(f"Thread stopped for: {attribute.name} ({attribute.id})")
 
 
-def _create_iot_client(region: str | None):
+def _resolve_credentials() -> dict | None:
+    """Single source of truth for credential resolution, shared by the publish client
+    and the feedback listener so the two can never end up authenticating differently.
+
+    Returns the credentials file's contents if one is present, or None to signal
+    "use this SDK's own default credential chain (env vars / IMDS / profile / etc.)".
+    """
     if os.path.exists(CREDENTIALS_PATH):
-        creds = AWS_CREDENTIALS().credentials
+        return AWS_CREDENTIALS(CREDENTIALS_PATH).credentials
+    return None
+
+
+def _resolve_credentials_provider() -> "auth.AwsCredentialsProvider":
+    """The MQTT-side counterpart of _resolve_credentials(): builds a static
+    awscrt credentials provider from the same credentials file the publish client
+    uses, or falls back to awscrt's own default chain when there is no file.
+    """
+    creds = _resolve_credentials()
+    if creds is not None:
+        return auth.AwsCredentialsProvider.new_static(
+            access_key_id=creds["aws_access_key_id"],
+            secret_access_key=creds["aws_secret_access_key"],
+            session_token=creds.get("aws_session_token"),
+        )
+    return auth.AwsCredentialsProvider.new_default_chain()
+
+
+def _resolve_region(region: str | None) -> str:
+    """Single source of truth for region resolution, shared by the publish client
+    and the feedback listener so the two can never end up pointed at different regions.
+    """
+    if region:
+        return region
+
+    creds = _resolve_credentials()
+    if creds and creds.get("aws_region"):
+        return creds["aws_region"]
+
+    return os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or DEFAULT_AWS_REGION
+
+
+def _boto3_client(service_name: str, region: str | None = None):
+    """Single construction point for every boto3 client in this file, so region and
+    credential resolution can never drift between them - every caller (publish client,
+    endpoint lookup, anything added later) goes through the same resolved values instead
+    of any of them accidentally falling back to boto3's own default chain on their own.
+    """
+    resolved_region = _resolve_region(region)
+    creds = _resolve_credentials()
+
+    if creds is not None:
         return boto3.client(
-            'iot-data',
-            region_name=region or creds["aws_region"],
+            service_name,
+            region_name=resolved_region,
             aws_access_key_id=creds["aws_access_key_id"],
             aws_secret_access_key=creds["aws_secret_access_key"],
+            aws_session_token=creds.get("aws_session_token"),
         )
 
-    return boto3.client(
-        'iot-data',
-        region_name=(
-            region
-            or os.getenv("AWS_REGION")
-            or os.getenv("AWS_DEFAULT_REGION")
-            or DEFAULT_AWS_REGION
-        ),
-    )
+    return boto3.client(service_name, region_name=resolved_region)
+
+
+def _create_iot_client(region: str | None):
+    return _boto3_client('iot-data', region)
 
 
 def _is_enabled(value: str | None) -> bool:

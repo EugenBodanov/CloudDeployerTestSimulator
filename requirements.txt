@@ -1,3 +1,4 @@
 python-dotenv
 nicegui
 boto3~=1.43.30
+awsiotsdk
